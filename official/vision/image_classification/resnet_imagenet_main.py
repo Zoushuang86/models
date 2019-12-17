@@ -18,6 +18,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import os
+
 from absl import app
 from absl import flags
 from absl import logging
@@ -32,42 +34,6 @@ from official.utils.misc import model_helpers
 from official.vision.image_classification import common
 from official.vision.image_classification import imagenet_preprocessing
 from official.vision.image_classification import resnet_model
-
-LR_SCHEDULE = [    # (multiplier, epoch to start) tuples
-    (1.0, 5), (0.1, 30), (0.01, 60), (0.001, 80)
-]
-
-
-def learning_rate_schedule(current_epoch,
-                           current_batch,
-                           batches_per_epoch,
-                           batch_size):
-  """Handles linear scaling rule, gradual warmup, and LR decay.
-
-  Scale learning rate at epoch boundaries provided in LR_SCHEDULE by the
-  provided scaling factor.
-
-  Args:
-    current_epoch: integer, current epoch indexed from 0.
-    current_batch: integer, current batch in the current epoch, indexed from 0.
-    batches_per_epoch: integer, number of steps in an epoch.
-    batch_size: integer, total batch sized.
-
-  Returns:
-    Adjusted learning rate.
-  """
-  initial_lr = common.BASE_LEARNING_RATE * batch_size / 256
-  epoch = current_epoch + float(current_batch) / batches_per_epoch
-  warmup_lr_multiplier, warmup_end_epoch = LR_SCHEDULE[0]
-  if epoch < warmup_end_epoch:
-    # Learning rate increases linearly per step.
-    return initial_lr * warmup_lr_multiplier * epoch / warmup_end_epoch
-  for mult, start_epoch in LR_SCHEDULE:
-    if epoch >= start_epoch:
-      learning_rate = initial_lr * mult
-    else:
-      break
-  return learning_rate
 
 
 def run(flags_obj):
@@ -88,19 +54,25 @@ def run(flags_obj):
 
   # Execute flag override logic for better model performance
   if flags_obj.tf_gpu_thread_mode:
-    common.set_gpu_thread_mode_and_count(flags_obj)
-  if flags_obj.data_delay_prefetch:
-    common.data_delay_prefetch()
+    keras_utils.set_gpu_thread_mode_and_count(
+        per_gpu_thread_count=flags_obj.per_gpu_thread_count,
+        gpu_thread_mode=flags_obj.tf_gpu_thread_mode,
+        num_gpus=flags_obj.num_gpus,
+        datasets_num_private_threads=flags_obj.datasets_num_private_threads)
   common.set_cudnn_batchnorm_mode()
 
   dtype = flags_core.get_tf_dtype(flags_obj)
-  if dtype == 'float16':
+  if dtype == tf.float16:
     loss_scale = flags_core.get_loss_scale(flags_obj, default_for_fp16=128)
     policy = tf.compat.v2.keras.mixed_precision.experimental.Policy(
         'mixed_float16', loss_scale=loss_scale)
     tf.compat.v2.keras.mixed_precision.experimental.set_policy(policy)
     if not keras_utils.is_v2_0():
       raise ValueError('--dtype=fp16 is not supported in TensorFlow 1.')
+  elif dtype == tf.bfloat16:
+    policy = tf.compat.v2.keras.mixed_precision.experimental.Policy(
+        'mixed_bfloat16')
+    tf.compat.v2.keras.mixed_precision.experimental.set_policy(policy)
 
   data_format = flags_obj.data_format
   if data_format is None:
@@ -117,7 +89,8 @@ def run(flags_obj):
       num_gpus=flags_obj.num_gpus,
       num_workers=num_workers,
       all_reduce_alg=flags_obj.all_reduce_alg,
-      num_packs=flags_obj.num_packs)
+      num_packs=flags_obj.num_packs,
+      tpu_address=flags_obj.tpu)
 
   if strategy:
     # flags_obj.enable_get_next_as_optional controls whether enabling
@@ -157,6 +130,7 @@ def run(flags_obj):
       dtype=dtype,
       drop_remainder=drop_remainder,
       tf_data_experimental_slack=flags_obj.tf_data_experimental_slack,
+      training_dataset_cache=flags_obj.training_dataset_cache,
   )
 
   eval_input_dataset = None
@@ -175,9 +149,9 @@ def run(flags_obj):
     lr_schedule = common.PiecewiseConstantDecayWithWarmup(
         batch_size=flags_obj.batch_size,
         epoch_size=imagenet_preprocessing.NUM_IMAGES['train'],
-        warmup_epochs=LR_SCHEDULE[0][1],
-        boundaries=list(p[1] for p in LR_SCHEDULE[1:]),
-        multipliers=list(p[0] for p in LR_SCHEDULE),
+        warmup_epochs=common.LR_SCHEDULE[0][1],
+        boundaries=list(p[1] for p in common.LR_SCHEDULE[1:]),
+        multipliers=list(p[0] for p in common.LR_SCHEDULE),
         compute_lr_on_cpu=True)
 
   with strategy_scope:
@@ -217,15 +191,20 @@ def run(flags_obj):
                    if flags_obj.report_accuracy_metrics else None),
           run_eagerly=flags_obj.run_eagerly)
 
-  callbacks = common.get_callbacks(
-      learning_rate_schedule, imagenet_preprocessing.NUM_IMAGES['train'])
-
-  train_steps = (
+  steps_per_epoch = (
       imagenet_preprocessing.NUM_IMAGES['train'] // flags_obj.batch_size)
   train_epochs = flags_obj.train_epochs
 
-  if flags_obj.train_steps:
-    train_steps = min(flags_obj.train_steps, train_steps)
+  callbacks = common.get_callbacks(steps_per_epoch,
+                                   common.learning_rate_schedule)
+  if flags_obj.enable_checkpoint_and_export:
+    ckpt_full_path = os.path.join(flags_obj.model_dir, 'model.ckpt-{epoch:04d}')
+    callbacks.append(tf.keras.callbacks.ModelCheckpoint(ckpt_full_path,
+                                                        save_weights_only=True))
+
+  # if mutliple epochs, ignore the train_steps flag.
+  if train_epochs <= 1 and flags_obj.train_steps:
+    steps_per_epoch = min(flags_obj.train_steps, steps_per_epoch)
     train_epochs = 1
 
   num_eval_steps = (
@@ -251,12 +230,19 @@ def run(flags_obj):
 
   history = model.fit(train_input_dataset,
                       epochs=train_epochs,
-                      steps_per_epoch=train_steps,
+                      steps_per_epoch=steps_per_epoch,
                       callbacks=callbacks,
                       validation_steps=num_eval_steps,
                       validation_data=validation_data,
                       validation_freq=flags_obj.epochs_between_evals,
                       verbose=2)
+  if flags_obj.enable_checkpoint_and_export:
+    if dtype == tf.bfloat16:
+      logging.warning("Keras model.save does not support bfloat16 dtype.")
+    else:
+      # Keras model.save assumes a float32 input designature.
+      export_path = os.path.join(flags_obj.model_dir, 'saved_model')
+      model.save(export_path, include_optimizer=False)
 
   eval_output = None
   if not flags_obj.skip_eval:
@@ -273,7 +259,7 @@ def run(flags_obj):
 
 def define_imagenet_keras_flags():
   common.define_keras_flags()
-  flags_core.set_defaults(train_epochs=90)
+  flags_core.set_defaults()
   flags.adopt_module_key_flags(common)
 
 

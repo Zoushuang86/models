@@ -121,6 +121,7 @@ class Transformer(tf.keras.Model):
     if len(inputs) == 2:
       inputs, targets = inputs[0], inputs[1]
     else:
+      # Decoding path.
       inputs, targets = inputs[0], None
       if self.params["padded_decode"]:
         if not self.params["num_replicas"]:
@@ -128,8 +129,9 @@ class Transformer(tf.keras.Model):
               "Padded decoding on CPU/GPUs is not supported.")
         decode_batch_size = int(self.params["decode_batch_size"] /
                                 self.params["num_replicas"])
-        inputs = tf.reshape(
-            inputs, [decode_batch_size, self.params["decode_max_length"]])
+        inputs.set_shape([
+            decode_batch_size, self.params["decode_max_length"]
+        ])
 
     # Variance scaling is used here because it seems to work in many problems.
     # Other reasonable initializers may also work just as well.
@@ -200,7 +202,7 @@ class Transformer(tf.keras.Model):
       # Prepare inputs to decoder layers by shifting targets, adding positional
       # encoding and applying dropout.
       decoder_inputs = self.embedding_softmax_layer(targets)
-      decoder_inputs = tf.cast(decoder_inputs, self.params['dtype'])
+      decoder_inputs = tf.cast(decoder_inputs, self.params["dtype"])
       attention_bias = tf.cast(attention_bias, self.params["dtype"])
       with tf.name_scope("shift_targets"):
         # Shift targets to the right, and remove the last element
@@ -218,7 +220,7 @@ class Transformer(tf.keras.Model):
 
       # Run values
       decoder_self_attention_bias = model_utils.get_decoder_self_attention_bias(
-          length, dtype=self.params['dtype'])
+          length, dtype=self.params["dtype"])
       outputs = self.decoder_stack(
           decoder_inputs,
           encoder_outputs,
@@ -290,6 +292,7 @@ class Transformer(tf.keras.Model):
 
   def predict(self, encoder_outputs, encoder_decoder_attention_bias, training):
     """Return predicted sequence."""
+    encoder_outputs = tf.cast(encoder_outputs, self.params["dtype"])
     if self.params["padded_decode"]:
       batch_size = encoder_outputs.shape.as_list()[0]
       input_length = encoder_outputs.shape.as_list()[1]
@@ -310,16 +313,18 @@ class Transformer(tf.keras.Model):
     # pylint: disable=g-complex-comprehension
     init_decode_length = (
         max_decode_length if self.params["padded_decode"] else 0)
+    num_heads = self.params["num_heads"]
+    dim_per_head = self.params["hidden_size"] // num_heads
     cache = {
         "layer_%d" % layer: {
             "k":
                 tf.zeros([
-                    batch_size, init_decode_length, self.params["hidden_size"]
+                    batch_size, init_decode_length, num_heads, dim_per_head
                 ],
                          dtype=self.params["dtype"]),
             "v":
                 tf.zeros([
-                    batch_size, init_decode_length, self.params["hidden_size"]
+                    batch_size, init_decode_length, num_heads, dim_per_head
                 ],
                          dtype=self.params["dtype"])
         } for layer in range(self.params["num_hidden_layers"])
@@ -350,48 +355,6 @@ class Transformer(tf.keras.Model):
     return {"outputs": top_decoded_ids, "scores": top_scores}
 
 
-class LayerNormalization(tf.keras.layers.Layer):
-  """Applies layer normalization."""
-
-  def __init__(self, hidden_size):
-    super(LayerNormalization, self).__init__()
-    self.hidden_size = hidden_size
-
-  def build(self, input_shape):
-    """Builds the layer."""
-    # Passing experimental_autocast=False causes these variables to not be
-    # automatically casted to fp16 when mixed precision is used. Since we use
-    # float32 in call() for numeric stability, we do not want variables to be
-    # casted to fp16.
-    self.scale = self.add_weight(
-        "layer_norm_scale",
-        shape=[self.hidden_size],
-        dtype="float32",
-        initializer=tf.ones_initializer(),
-        experimental_autocast=False)
-    self.bias = self.add_weight(
-        "layer_norm_bias",
-        shape=[self.hidden_size],
-        dtype="float32",
-        initializer=tf.zeros_initializer(),
-        experimental_autocast=False)
-    super(LayerNormalization, self).build(input_shape)
-
-  def get_config(self):
-    return {
-        "hidden_size": self.hidden_size,
-    }
-
-  def call(self, x, epsilon=1e-6):
-    input_dtype = x.dtype
-    if input_dtype == tf.float16:
-      x = tf.cast(x, tf.float32)
-    mean = tf.reduce_mean(x, axis=[-1], keepdims=True)
-    variance = tf.reduce_mean(tf.square(x - mean), axis=[-1], keepdims=True)
-    norm_x = (x - mean) * tf.math.rsqrt(variance + epsilon)
-    return tf.cast(norm_x * self.scale + self.bias, input_dtype)
-
-
 class PrePostProcessingWrapper(tf.keras.layers.Layer):
   """Wrapper class that applies layer pre-processing and post-processing."""
 
@@ -403,7 +366,8 @@ class PrePostProcessingWrapper(tf.keras.layers.Layer):
 
   def build(self, input_shape):
     # Create normalization layer
-    self.layer_norm = LayerNormalization(self.params["hidden_size"])
+    self.layer_norm = tf.keras.layers.LayerNormalization(
+        epsilon=1e-6, dtype="float32")
     super(PrePostProcessingWrapper, self).build(input_shape)
 
   def get_config(self):
@@ -458,7 +422,8 @@ class EncoderStack(tf.keras.layers.Layer):
       ])
 
     # Create final layer normalization layer.
-    self.output_normalization = LayerNormalization(params["hidden_size"])
+    self.output_normalization = tf.keras.layers.LayerNormalization(
+        epsilon=1e-6, dtype="float32")
     super(EncoderStack, self).build(input_shape)
 
   def get_config(self):
@@ -531,7 +496,8 @@ class DecoderStack(tf.keras.layers.Layer):
           PrePostProcessingWrapper(enc_dec_attention_layer, params),
           PrePostProcessingWrapper(feed_forward_network, params)
       ])
-    self.output_normalization = LayerNormalization(params["hidden_size"])
+    self.output_normalization = tf.keras.layers.LayerNormalization(
+        epsilon=1e-6, dtype="float32")
     super(DecoderStack, self).build(input_shape)
 
   def get_config(self):
